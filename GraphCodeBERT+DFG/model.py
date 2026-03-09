@@ -25,15 +25,15 @@ class GraphCodeBERT(nn.Module):
             nn.Dropout(config.hidden_dropout_prob)
         )
         self.classifier = PredictionClassification(config, args, input_size= 1280)
-        
-        # ���������� RoBERTa ǰ n �㣨���綳��ǰ 6 �㣩
-        n_freeze_layers = 8  # �� ��ɸ���ʵ�������0=ȫ�ſ���12=ȫ����
+
+        # 新增：冻结 RoBERTa 前 n 层（例如冻结前 6 层）
+        n_freeze_layers = 8  # ← 你可根据实验调整：0=全放开，12=全冻结
         if n_freeze_layers > 0:
-            # ���� embeddings����ѡ��ͨ��������
+            # 冻结 embeddings（可选，通常保留）
             #for param in self.encoder.embeddings.parameters():
                 #param.requires_grad = False
 
-            # ���� Transformer ��������ǰ n ��
+            # 冻结 Transformer 编码器的前 n 层
             for layer in self.encoder.encoder.layer[:n_freeze_layers]:
                 for param in layer.parameters():
                     param.requires_grad = False
