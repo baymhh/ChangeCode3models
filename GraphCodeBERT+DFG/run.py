@@ -52,7 +52,10 @@ class InputFeatures(object):
                  dfg_to_dfg,
                  idx,
                  label,
-                 cpg_object
+                 cpg_object,
+                 desc_object=None,
+                 nl_ids=None,
+                 nl_mask=None
 
                  ):
         self.input_tokens = input_tokens
@@ -63,9 +66,12 @@ class InputFeatures(object):
         self.idx = str(idx)
         self.label = label
         self.cpg_object = cpg_object
+        self.desc_object = desc_object
+        self.nl_ids = nl_ids
+        self.nl_mask = nl_mask
 
 
-def convert_examples_to_features_graphcodebert(js, tokenizer, args, pkl_dir_path=None):
+def convert_examples_to_features_graphcodebert(js, tokenizer, args, pkl_dir_path=None, desc_dir_path=None):
     # source
     code = ' '.join(js['func'].split())
     dfg, index_table, code_tokens = extract_dataflow(code, "c")
@@ -120,7 +126,43 @@ def convert_examples_to_features_graphcodebert(js, tokenizer, args, pkl_dir_path
             print(f"警告：加载.pkl文件失败，cpg_object保持None，异常信息：{e}")
     # -------------------------------------------------------------------------------------
 
-    return InputFeatures(source_tokens, source_ids, position_idx, dfg_to_code, dfg_to_dfg, js['idx'], js['target'], cpg_object=cpg_object)
+    desc_object = None
+    if desc_dir_path is not None:  # 如果传入了.txt目录路径，才加载文件
+        # 1. 拼接当前js对应的.txt文件路径（根据之前生成.pkl的命名规则拼接）
+        # 之前生成.txt的命名格式：{desc}-{idx}-{target}.txt
+        idx = js['idx']
+        target = js['target']
+        desc_file_name = f"desc-{idx}-{target}.txt"
+        desc_file_path = os.path.join(desc_dir_path, desc_file_name)
+
+        # 2. 加载.txt文件
+        try:
+            with open(desc_file_path, 'r', encoding='utf-8') as f:
+                desc_object = f.read()
+        except FileNotFoundError:
+            print(f"警告：未找到对应的.txt文件，desc_object保持None：{desc_file_path}")
+        except Exception as e:
+            print(f"警告：加载.txt文件失败，desc_object保持None，异常信息：{e}")
+
+    # NL tokenize
+    nl_ids = [tokenizer.pad_token_id] * args.nl_length  # 默认全padding
+    nl_mask = [0] * args.nl_length
+
+    if desc_object is not None:
+        nl_tokens = tokenizer.tokenize(desc_object)[:args.nl_length - 2]
+        nl_tokens = [tokenizer.cls_token] + nl_tokens + [tokenizer.sep_token]
+        nl_ids_raw = tokenizer.convert_tokens_to_ids(nl_tokens)
+        nl_mask_raw = [1] * len(nl_ids_raw)
+        # padding
+        padding_length = args.nl_length - len(nl_ids_raw)
+        nl_ids = nl_ids_raw + [tokenizer.pad_token_id] * padding_length
+        nl_mask = nl_mask_raw + [0] * padding_length
+
+    return InputFeatures(source_tokens, source_ids, position_idx, dfg_to_code, dfg_to_dfg,
+                         js['idx'], js['target'],
+                         cpg_object=cpg_object, desc_object=desc_object,
+                         nl_ids=nl_ids, nl_mask=nl_mask)
+
 
 
 class TextDataset(Dataset):
@@ -151,7 +193,9 @@ class TextDataset(Dataset):
                 project_root_diro = os.path.dirname(current_script_diro)
                 pkl_dir_path = os.path.join(project_root_diro, 'joerntool', 'joern', 'data', 'runtrydata',
                                             f'cpg14_output_pickle_{split_name}')
-                self.examples.append(convert_examples_to_features_graphcodebert(js, self.tokenizer, args, pkl_dir_path))
+                desc_dir_path = os.path.join(project_root_diro, 'joerntool', 'joern', 'data', 'runtrydata',
+                                             f'desc_output_{split_name}')
+                self.examples.append(convert_examples_to_features_graphcodebert(js, self.tokenizer, args, pkl_dir_path, desc_dir_path))
 
         if 'train' in file_path:
             for idx, example in enumerate(self.examples[:3]):
@@ -161,6 +205,7 @@ class TextDataset(Dataset):
                 logger.info("input_tokens: {}".format([x.replace('\u0120', '_') for x in example.input_tokens]))
                 logger.info("input_ids: {}".format(' '.join(map(str, example.input_ids))))
                 logger.info("cpg_object: {}".format(list(example.cpg_object.nodes)))
+                logger.info("desc_object: {}".format(example.desc_object))
 
     def __len__(self):
         return len(self.examples)
@@ -191,7 +236,9 @@ class TextDataset(Dataset):
                 torch.tensor(ast_adj),
                 torch.tensor(cfg_adj),
                 torch.tensor(pdg_adj),
-                torch.tensor(cpg_node_features))
+                torch.tensor(cpg_node_features),
+                torch.tensor(self.examples[item].nl_ids),
+                torch.tensor(self.examples[item].nl_mask))
 
 
 def set_seed(seed=42):
@@ -214,6 +261,8 @@ def collate_fn(batch):
     # 记录每个样本的真实节点数
     num_nodes_list = []
 
+    nl_ids_list, nl_mask_list = [], []
+
     for item in batch:
         input_ids_list.append(item[0])
         attn_mask_list.append(item[1])
@@ -224,6 +273,8 @@ def collate_fn(batch):
         pdg_adj_list.append(item[6])
         feats_list.append(item[7])
         num_nodes_list.append(item[7].size(0))  # N
+        nl_ids_list.append(item[8])
+        nl_mask_list.append(item[9])
 
     # ========== 文本部分 ==========
     # 如果你已经在 tokenizer 中 pad 到固定长度：
@@ -256,6 +307,9 @@ def collate_fn(batch):
     for i, N in enumerate(num_nodes_list):
         node_mask[i, :N] = 1
 
+    nl_ids = torch.stack(nl_ids_list)
+    nl_mask = torch.stack(nl_mask_list)
+
     # 注意train中取数据时因为从元组变字典了，取数据的方式要变！！！！！！！！！
     return {
         'input_ids': input_ids,
@@ -266,7 +320,9 @@ def collate_fn(batch):
         'cfg_adj': cfg_batch,
         'pdg_adj': pdg_batch,
         'node_features': feats_batch,
-        'node_mask': node_mask
+        'node_mask': node_mask,
+        'nl_ids': nl_ids,
+        'nl_mask': nl_mask
     }
 
 
@@ -284,21 +340,31 @@ def train(args, train_dataset, model, tokenizer, modelencoder):
     args.logging_steps = len(train_dataloader)
     args.num_train_epochs = args.epoch
     model.to(args.device)
-    
-    
+
+
     # === FROZEN LAYERS VERIFICATION ===
-    print("\n VERIFICATION: Frozen parameters in GraphCodeBERT")
+    print("\n VERIFICATION: Frozen parameters overview (entire model)")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_percent = (total_params - trainable_params) / total_params * 100
-    print(f"   Total params: {total_params:,} | Trainable: {trainable_params:,} ({trainable_params/total_params*100:.1f}%) | Frozen: {frozen_percent:.1f}%")
+    print(f"   Total params: {total_params:,} | Trainable: {trainable_params:,} ({trainable_params / total_params * 100:.1f}%) | Frozen: {frozen_percent:.1f}%")
 
-    # Print encoder layer status
+    # GraphCodeBERT's layer status
+    print("\n VERIFICATION: Frozen layers in GraphCodeBERT (code encoder)")
     if hasattr(model, 'encoder') and hasattr(model.encoder, 'encoder') and hasattr(model.encoder.encoder, 'layer'):
         for i, layer in enumerate(model.encoder.encoder.layer):
             layer_trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
             status = "FROZEN" if layer_trainable == 0 else "TRAINABLE"
-            print(f"   Encoder Layer {i}: {status}")
+            print(f"   GraphCodeBERT Layer {i}: {status}")
+
+    # CodeBERT's layer status
+    print("\n VERIFICATION: Frozen layers in CodeBERT (nl encoder)")
+    if hasattr(model, 'nl_encoder') and hasattr(model.nl_encoder, 'encoder') and hasattr(model.nl_encoder.encoder, 'layer'):
+        for i, layer in enumerate(model.nl_encoder.encoder.layer):
+            layer_trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
+            status = "FROZEN" if layer_trainable == 0 else "TRAINABLE"
+            print(f"   CodeBERT Layer {i}: {status}")
+
     print("===================================\n")
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
@@ -363,11 +429,14 @@ def train(args, train_dataset, model, tokenizer, modelencoder):
             node_features = batch['node_features'].to(args.device)  # [B, M, F]
             node_mask = batch['node_mask'].to(args.device)  # [B, M]
 
+            nl_input_ids = batch['nl_ids'].to(args.device)
+            nl_attn_mask = batch['nl_mask'].to(args.device)
+
             model.train()
 
             # 传参给模型的时候也要改
             loss, logits = model(input_ids, attention_mask, position_idx, labels, ast_adj, cfg_adj, pdg_adj,
-                                 node_features, node_mask)
+                                 node_features, node_mask, nl_input_ids, nl_attn_mask)
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -472,12 +541,14 @@ def evaluate(args, model, tokenizer, modelencoder, eval_when_training=False):
         pdg_adj = batch['pdg_adj'].to(args.device)  # [B, M, M, 1]
         node_features = batch['node_features'].to(args.device)  # [B, M, F]
         node_mask = batch['node_mask'].to(args.device)  # [B, M]
+        nl_input_ids = batch['nl_ids'].to(args.device)
+        nl_attn_mask = batch['nl_mask'].to(args.device)
 
         # 传参给模型的时候也要改
         with torch.no_grad():
             logit = model(input_ids, attention_mask, position_idx, None,
-                          ast_adj, cfg_adj, pdg_adj,
-                          node_features, node_mask)
+                          ast_adj, cfg_adj, pdg_adj, node_features, node_mask,
+                          nl_input_ids, nl_attn_mask)
 
             loss_fct = torch.nn.BCEWithLogitsLoss()
             loss = loss_fct(logit, label.float())  # 自动 reduction='mean'
@@ -548,12 +619,14 @@ def test(args, model, tokenizer, modelencoder):
         node_features = batch['node_features'].to(args.device)  # [B, M, F]
         node_mask = batch['node_mask'].to(args.device)  # [B, M]
         node_mask = batch['node_mask'].to(args.device)  # [B, M]
+        nl_input_ids = batch['nl_ids'].to(args.device)
+        nl_attn_mask = batch['nl_mask'].to(args.device)
 
         # 传参给模型的时候也要改
         with torch.no_grad():
             logit = model(input_ids, attention_mask, position_idx, None,
-                          ast_adj, cfg_adj, pdg_adj,
-                          node_features, node_mask)
+                          ast_adj, cfg_adj, pdg_adj, node_features, node_mask,
+                          nl_input_ids, nl_attn_mask)
 
         logits.append(logit.cpu())
         labels.append(label.cpu())
@@ -704,6 +777,11 @@ def main():
     parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
     parser.add_argument("--eval_epoch", type=int, default=0, help="Which epoch checkpoint to evaluate/test.")
 
+    parser.add_argument("--nl_model_name_or_path", default=None, type=str,
+                        help="CodeBERT path")
+    parser.add_argument("--nl_length", default=128, type=int,
+                        help="NL sequence max length")
+
     args = parser.parse_args()
 
     # Setup distant debugging if needed
@@ -764,6 +842,10 @@ def main():
 
     # 先保留一下这个副本
     modelencoder = model
+
+    nl_encoder = RobertaModel.from_pretrained(args.nl_model_name_or_path)
+    model = GraphCodeBERT(model, config, tokenizer, args, nl_encoder=nl_encoder)
+
     model = GraphCodeBERT(model, config, tokenizer, args)
     if args.local_rank == 0:
         torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
