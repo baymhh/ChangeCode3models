@@ -17,14 +17,26 @@ class GraphCodeBERT(nn.Module):
         self.query = 0
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = PredictionClassification(config, args, input_size= 1024)
+        
+        # 新增：冻结 RoBERTa 前 n 层（例如冻结前 6 层）
+        n_freeze_layers = 8  # ← 你可根据实验调整：0=全放开，12=全冻结
+        if n_freeze_layers > 0:
+            # 冻结 embeddings（可选，通常保留）
+            #for param in self.encoder.embeddings.parameters():
+                #param.requires_grad = False
+
+            # 冻结 Transformer 编码器的前 n 层
+            for layer in self.encoder.encoder.layer[:n_freeze_layers]:
+                for param in layer.parameters():
+                    param.requires_grad = False
+        
 
     def forward(self, inputs_ids=None, attn_mask=None, position_idx=None, labels=None, ast_adj=None, cfg_adj=None, pdg_adj=None, node_features=None, node_mask=None):
         g_emb = self.graphEmb(node_features.to(device).float(), ast_adj.to(device).float(), cfg_adj.to(device).float(), pdg_adj.to(device).float(), node_mask.to(device).float())
         nodes_mask = position_idx.eq(0)
         token_mask = position_idx.ge(2)
 
-        inputs_embeddings = self.encoder.embeddings.word_embeddings(
-            inputs_ids)
+        inputs_embeddings = self.encoder.embeddings.word_embeddings(inputs_ids)
 
         vec = self.encoder(inputs_embeds=inputs_embeddings,attention_mask=attn_mask, position_ids=position_idx)[0][:, 0, :]
         outputs = self.classifier(torch.cat((vec, g_emb), dim=1))

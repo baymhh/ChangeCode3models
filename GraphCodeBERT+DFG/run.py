@@ -284,6 +284,22 @@ def train(args, train_dataset, model, tokenizer, modelencoder):
     args.logging_steps = len(train_dataloader)
     args.num_train_epochs = args.epoch
     model.to(args.device)
+    
+    
+    # === FROZEN LAYERS VERIFICATION ===
+    print("\n VERIFICATION: Frozen parameters in GraphCodeBERT")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_percent = (total_params - trainable_params) / total_params * 100
+    print(f"   Total params: {total_params:,} | Trainable: {trainable_params:,} ({trainable_params/total_params*100:.1f}%) | Frozen: {frozen_percent:.1f}%")
+
+    # Print encoder layer status
+    if hasattr(model, 'encoder') and hasattr(model.encoder, 'encoder') and hasattr(model.encoder.encoder, 'layer'):
+        for i, layer in enumerate(model.encoder.encoder.layer):
+            layer_trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
+            status = "FROZEN" if layer_trainable == 0 else "TRAINABLE"
+            print(f"   Encoder Layer {i}: {status}")
+    print("===================================\n")
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -402,21 +418,17 @@ def train(args, train_dataset, model, tokenizer, modelencoder):
                             logger.info("  %s = %s", key, round(value, 4))
                             # Save model checkpoint
 
-                    if results['eval_acc'] > best_acc:
-                        best_acc = results['eval_acc']
-                        logger.info("  " + "*" * 20)
-                        logger.info("  Best acc:%s", round(best_acc, 4))
-                        logger.info("  " + "*" * 20)
+                    
+                    epoch_output_dir = os.path.join(args.output_dir, f"checkpoint-epoch-{idx}")
+                    os.makedirs(epoch_output_dir, exist_ok=True)
 
-                        output_dir = args.output_dir
-                        if not os.path.exists(output_dir):
-                            os.makedirs(output_dir)
-                        model_to_save = model.module if hasattr(model, 'module') else model
-                        # output_dir = os.path.join(output_dir, '{}'.format('model.bin'))
-                        # torch.save(model_to_save.state_dict(), output_dir)
-                        output_dir = os.path.join(output_dir, '{}'.format('model.pth'))
-                        torch.save(model_to_save, output_dir)
-                        logger.info("Saving model checkpoint to %s", output_dir)
+                    model_to_save = model.module if hasattr(model, 'module') else model
+                    torch.save(model_to_save, os.path.join(epoch_output_dir, "model.pth"))
+                    logger.info(f"Saved checkpoint for epoch {idx} to {epoch_output_dir}")
+
+                    
+                    
+                    
 
 
 # 新增参数modelencoder
@@ -690,6 +702,7 @@ def main():
                         help="For distributed training: local_rank")
     parser.add_argument('--server_ip', type=str, default='', help="For distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
+    parser.add_argument("--eval_epoch", type=int, default=0, help="Which epoch checkpoint to evaluate/test.")
 
     args = parser.parse_args()
 
@@ -773,13 +786,10 @@ def main():
     results = {}
     # 修复do_eval逻辑
     if args.do_eval and args.local_rank in [-1, 0]:
-        # 修复1：使用训练时保存的model.pth路径
-        model_path = os.path.join(args.output_dir, "model.pth")
-        # 修复2：加载完整模型（而非权重字典）
+        model_path = os.path.join(args.output_dir, f"checkpoint-epoch-{args.eval_epoch}", "model.pth")
+        logger.info(f"Loading model from {model_path}")
         model = torch.load(model_path)
-        # 修复3：将模型移到指定设备
         model.to(args.device)
-        # 新增参数modelencoder
         result = evaluate(args, model, tokenizer, modelencoder, eval_when_training=False)
         logger.info("***** Eval results *****")
         for key in sorted(result.keys()):
@@ -787,11 +797,9 @@ def main():
 
     # 修复do_test逻辑
     if args.do_test and args.local_rank in [-1, 0]:
-        # 修复1：使用训练时保存的model.pth路径
-        model_path = os.path.join(args.output_dir, "model.pth")
-        # 修复2：加载完整模型（而非权重字典）
+        model_path = os.path.join(args.output_dir, f"checkpoint-epoch-{args.eval_epoch}", "model.pth")
+        logger.info(f"Loading model from {model_path}")
         model = torch.load(model_path)
-        # 修复3：将模型移到指定设备
         model.to(args.device)
         # 新增参数modelencoder
         test(args, model, tokenizer, modelencoder)
