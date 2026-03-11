@@ -846,7 +846,6 @@ def main():
     nl_encoder = RobertaModel.from_pretrained(args.nl_model_name_or_path)
     model = GraphCodeBERT(model, config, tokenizer, args, nl_encoder=nl_encoder)
 
-    model = GraphCodeBERT(model, config, tokenizer, args)
     if args.local_rank == 0:
         torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
 
