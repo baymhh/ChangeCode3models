@@ -13,9 +13,9 @@ class GraphCodeBERT(nn.Module):
         self.config = config
         self.tokenizer = tokenizer
         self.args = args
-        self.w_embeddings = self.encoder.embeddings.word_embeddings.weight.data.cpu().detach().clone().numpy()
+
         self.graphEmb = GraphEmbedding(feature_dim_size=768, hidden_size=256, dropout=config.hidden_dropout_prob)
-        self.query = 0
+
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # NL投影层：768 → 256，与graph_emb维度对齐
         self.nl_projector = nn.Sequential(
@@ -46,8 +46,7 @@ class GraphCodeBERT(nn.Module):
 
     def forward(self, inputs_ids=None, attn_mask=None, position_idx=None, labels=None, ast_adj=None, cfg_adj=None, pdg_adj=None, node_features=None, node_mask=None, nl_input_ids=None, nl_attn_mask=None):
         g_emb = self.graphEmb(node_features.to(device).float(), ast_adj.to(device).float(), cfg_adj.to(device).float(), pdg_adj.to(device).float(), node_mask.to(device).float())
-        nodes_mask = position_idx.eq(0)
-        token_mask = position_idx.ge(2)
+
 
         inputs_embeddings = self.encoder.embeddings.word_embeddings(inputs_ids)
 
