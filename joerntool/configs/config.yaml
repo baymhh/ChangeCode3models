@@ -5,4 +5,3 @@ joern:
   data_folder: "data"
   export_format: [ 'cpg14' ]
   export_type: 'dot'
-  generate_file_suffix: '.c'

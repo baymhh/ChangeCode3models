@@ -122,7 +122,7 @@ def generate_pdg(config: DictConfig, js, clean_func, temp_function_dir_path, out
     try:
         # 从JSON数据中提取关键信息
         idx = js['idx']
-        target = js['target']
+        target = js['label']
         func = js['func']
 
         # 从配置中获取Joern工具的路径
@@ -133,7 +133,7 @@ def generate_pdg(config: DictConfig, js, clean_func, temp_function_dir_path, out
         export_type = config.export_type
 
         # 临时代码文件后缀（如.c/.java）
-        generate_file_suffix = config.generate_file_suffix
+        generate_file_suffix = js.get('lang', '.c')
 
         # 构建临时代码文件的名称（带ID和标签，避免重名）
         temp_function_file_name = f'temp_function-{idx}-{target}'
