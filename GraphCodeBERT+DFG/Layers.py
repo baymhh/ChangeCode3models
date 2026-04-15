@@ -160,12 +160,15 @@ class PredictionClassification(nn.Module):
         self.dropout = nn.Dropout(0.3)
         self.out_proj = nn.Linear(256, 1)   #  关键：1
 
-    def forward(self, features):
+    def forward(self, features, output_vec=False):
         x = self.dropout(features)
         x = self.dense(x.float())
         x = torch.tanh(x)
+        mid_vec = x  # ← 256维中间表示，tanh之后、第二个dropout之前
         x = self.dropout(x)
         x = self.out_proj(x)
+        if output_vec:
+            return x, mid_vec
         return x
 
 

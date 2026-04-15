@@ -44,13 +44,13 @@ class GraphCodeBERT(nn.Module):
                 for param in layer.parameters():
                     param.requires_grad = False
 
-    def forward(self, inputs_ids=None, attn_mask=None, position_idx=None, labels=None, ast_adj=None, cfg_adj=None, pdg_adj=None, node_features=None, node_mask=None, nl_input_ids=None, nl_attn_mask=None):
+    def forward(self, inputs_ids=None, attn_mask=None, position_idx=None, labels=None, ast_adj=None, cfg_adj=None, pdg_adj=None, node_features=None, node_mask=None, nl_input_ids=None, nl_attn_mask=None, output_vec=False):
         g_emb = self.graphEmb(node_features.to(device).float(), ast_adj.to(device).float(), cfg_adj.to(device).float(), pdg_adj.to(device).float(), node_mask.to(device).float())
 
 
         inputs_embeddings = self.encoder.embeddings.word_embeddings(inputs_ids)
 
-        vec = self.encoder(inputs_embeds=inputs_embeddings,attention_mask=attn_mask, position_ids=position_idx)[0][:, 0, :]
+        vec = self.encoder(inputs_embeds=inputs_embeddings, attention_mask=attn_mask, position_ids=position_idx)[0][:, 0, :]
         # 3. NL embedding
         if self.nl_encoder is not None and nl_input_ids is not None:
             nl_hidden = self.nl_encoder(
@@ -67,9 +67,17 @@ class GraphCodeBERT(nn.Module):
             # 没有NL时退化为两路，便于消融实验
             combined = torch.cat([vec, g_emb], dim=1)  # [B, 1024]
 
+        pre_cls_vec = combined  # ← 分类头前的向量 [B, 1280]
         combined = self.dropout(combined)
-        outputs = self.classifier(combined)
-        logits = outputs.squeeze(-1)
+        if output_vec:
+            logits_raw, mid_vec = self.classifier(combined, output_vec=True)  # mid_vec: [B, 256]
+        else:
+            logits_raw = self.classifier(combined)
+
+        logits = logits_raw.squeeze(-1)
+
+        if output_vec:
+            return logits, pre_cls_vec, mid_vec  # ← 三元组返回
 
         if labels is not None:
             labels = labels.float()

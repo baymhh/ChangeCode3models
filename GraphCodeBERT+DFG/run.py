@@ -9,6 +9,7 @@ import logging
 import argparse
 import numpy as np
 import multiprocessing
+from numpy.linalg import norm
 sys.path.append('./parser')
 
 
@@ -59,7 +60,7 @@ class InputFeatures(object):
         self.input_tokens = input_tokens
         self.input_ids = input_ids
         self.position_idx = position_idx
-        self.idx = str(idx)
+        self.idx = idx
         self.label = label
         self.cpg_object = cpg_object
         self.desc_object = desc_object
@@ -191,20 +192,13 @@ class TextDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, item):
-        # calculate graph-guided masked function
         attn_mask = np.zeros((self.args.code_length + self.args.data_flow_length,
                               self.args.code_length + self.args.data_flow_length), dtype=np.bool_)
-        # calculate begin index of node and max length of input
-
-
         max_length = sum([i != 1 for i in self.examples[item].position_idx])
-        # sequence can attend to sequence
         attn_mask[:max_length, :max_length] = True
-        # special tokens attend to all tokens
         for idx, i in enumerate(self.examples[item].input_ids):
             if i in [0, 2]:
                 attn_mask[idx, :max_length] = True
-
 
         ast_adj, cfg_adj, pdg_adj, cpg_node_features = preprocess_cpg_sub(self.examples[item],
                                                                           self.tokenizer, self.cpg_embeddings)
@@ -218,7 +212,8 @@ class TextDataset(Dataset):
                 torch.tensor(pdg_adj),
                 torch.tensor(cpg_node_features),
                 torch.tensor(self.examples[item].nl_ids),
-                torch.tensor(self.examples[item].nl_mask))
+                torch.tensor(self.examples[item].nl_mask),
+                self.examples[item].idx)  # ← 新增，字符串直接返回，不转tensor
 
 
 def set_seed(seed=42):
@@ -232,16 +227,13 @@ def set_seed(seed=42):
 
 # 加一个批加载器collate_fn
 def collate_fn(batch):
-    # 解包
     input_ids_list, attn_mask_list, pos_idx_list = [], [], []
     labels_list = []
     ast_adj_list, cfg_adj_list, pdg_adj_list = [], [], []
     feats_list = []
-
-    # 记录每个样本的真实节点数
     num_nodes_list = []
-
     nl_ids_list, nl_mask_list = [], []
+    idx_list = []   # ← 新增
 
     for item in batch:
         input_ids_list.append(item[0])
@@ -252,26 +244,23 @@ def collate_fn(batch):
         cfg_adj_list.append(item[5])
         pdg_adj_list.append(item[6])
         feats_list.append(item[7])
-        num_nodes_list.append(item[7].size(0))  # N
+        num_nodes_list.append(item[7].size(0))
         nl_ids_list.append(item[8])
         nl_mask_list.append(item[9])
+        idx_list.append(item[10])   # ← 新增
 
-    # ========== 文本部分 ==========
-    # 如果你已经在 tokenizer 中 pad 到固定长度：
     input_ids = torch.stack(input_ids_list)
     attention_mask = torch.stack(attn_mask_list)
     position_idx = torch.stack(pos_idx_list)
     labels = torch.stack(labels_list)
 
-    # ========== 图部分 ==========
     max_nodes = max(f.size(0) for f in feats_list)
 
     def pad_to_max(tensor_2d):
         N = tensor_2d.size(0)
         pad_size = max_nodes - N
         padded = F.pad(tensor_2d, (0, pad_size, 0, pad_size), value=0)
-        # return padded.unsqueeze(-1)  # [M, M] -> [M, M, 1]
-        return padded  # [M, M]
+        return padded
 
     ast_batch = torch.stack([pad_to_max(adj) for adj in ast_adj_list])
     cfg_batch = torch.stack([pad_to_max(adj) for adj in cfg_adj_list])
@@ -282,7 +271,6 @@ def collate_fn(batch):
         for feat in feats_list
     ])
 
-    # node_mask → [B, M]， 注意掩码时需要广播一下，通过unsqueeze(-1)弄到合适的维度
     node_mask = torch.zeros(len(batch), max_nodes, dtype=torch.bool)
     for i, N in enumerate(num_nodes_list):
         node_mask[i, :N] = 1
@@ -290,7 +278,6 @@ def collate_fn(batch):
     nl_ids = torch.stack(nl_ids_list)
     nl_mask = torch.stack(nl_mask_list)
 
-    # 注意train中取数据时因为从元组变字典了，取数据的方式要变！！！！！！！！！
     return {
         'input_ids': input_ids,
         'attention_mask': attention_mask,
@@ -302,7 +289,8 @@ def collate_fn(batch):
         'node_features': feats_batch,
         'node_mask': node_mask,
         'nl_ids': nl_ids,
-        'nl_mask': nl_mask
+        'nl_mask': nl_mask,
+        'idx': torch.tensor(idx_list, dtype=torch.long)    # ← 新增，List[str]，保持字符串列表
     }
 
 
@@ -565,19 +553,16 @@ def evaluate(args, model, tokenizer, modelencoder, eval_when_training=False):
 
 # 新增参数modelencoder
 def test(args, model, tokenizer, modelencoder):
-    # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_dataset = TextDataset(tokenizer, args, modelencoder, args.test_data_file)
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
     eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, collate_fn=collate_fn)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler,
+                                 batch_size=args.eval_batch_size, collate_fn=collate_fn)
 
-    # multi-gpu evaluate
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
-    # Eval!
     logger.info("***** Running Test *****")
     logger.info("  Num examples = %d", len(eval_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
@@ -586,27 +571,41 @@ def test(args, model, tokenizer, modelencoder):
     logits = []
     labels = []
 
+    # 向量收集容器（仅在 output_vec 模式下使用）
+    all_pre_cls_vecs = []   # 分类头前 [B, 1280]
+    all_mid_vecs = []       # 分类头内256维 [B, 256]
+    all_idx = []            # 样本 idx
+
     for batch in tqdm(eval_dataloader, total=len(eval_dataloader)):
-        # 从 batch dict 中提取并移到设备上(原来是元组，现在是字典)
         input_ids = batch['input_ids'].to(args.device)
         attention_mask = batch['attention_mask'].to(args.device)
         position_idx = batch['position_idx'].to(args.device)
         label = batch['labels'].to(args.device)
-
-        ast_adj = batch['ast_adj'].to(args.device)  # [B, M, M, 1]
-        cfg_adj = batch['cfg_adj'].to(args.device)  # [B, M, M, 1]
-        pdg_adj = batch['pdg_adj'].to(args.device)  # [B, M, M, 1]
-        node_features = batch['node_features'].to(args.device)  # [B, M, F]
-        node_mask = batch['node_mask'].to(args.device)  # [B, M]
-        node_mask = batch['node_mask'].to(args.device)  # [B, M]
+        ast_adj = batch['ast_adj'].to(args.device)
+        cfg_adj = batch['cfg_adj'].to(args.device)
+        pdg_adj = batch['pdg_adj'].to(args.device)
+        node_features = batch['node_features'].to(args.device)
+        node_mask = batch['node_mask'].to(args.device)
         nl_input_ids = batch['nl_ids'].to(args.device)
         nl_attn_mask = batch['nl_mask'].to(args.device)
 
-        # 传参给模型的时候也要改
         with torch.no_grad():
-            logit = model(input_ids, attention_mask, position_idx, None,
-                          ast_adj, cfg_adj, pdg_adj, node_features, node_mask,
-                          nl_input_ids, nl_attn_mask)
+            if args.output_vec:
+                logit, pre_cls_vec, mid_vec = model(
+                    input_ids, attention_mask, position_idx, None,
+                    ast_adj, cfg_adj, pdg_adj, node_features, node_mask,
+                    nl_input_ids, nl_attn_mask,
+                    output_vec=True           # ← 唯一新增参数
+                )
+                all_pre_cls_vecs.append(pre_cls_vec.detach().cpu().numpy())
+                all_mid_vecs.append(mid_vec.detach().cpu().numpy())
+                all_idx.extend(batch['idx'].tolist()) # ← 需要 Dataset 返回 idx
+            else:
+                logit = model(
+                    input_ids, attention_mask, position_idx, None,
+                    ast_adj, cfg_adj, pdg_adj, node_features, node_mask,
+                    nl_input_ids, nl_attn_mask
+                )
 
         logits.append(logit.cpu())
         labels.append(label.cpu())
@@ -632,15 +631,12 @@ def test(args, model, tokenizer, modelencoder):
         "total_samples": len(labels)
     }
 
-    # ========== 完善输出/记录逻辑 ==========
-    # 1. 控制台打印（清晰排版）
     print("\n" + "=" * 50)
     print("***** Test Set Evaluation Results *****")
     for key, value in metrics.items():
         print(f"  {key}: {value}")
     print("=" * 50 + "\n")
 
-    # 2. 写入logger（和训练日志统一，方便后续查看）
     logger.info("***** Test Set Evaluation Results *****")
     for key, value in metrics.items():
         logger.info(f"  {key} = {value}")
@@ -653,6 +649,30 @@ def test(args, model, tokenizer, modelencoder):
     preds_file = os.path.join(args.output_dir, "test_predictions.npz")
     np.savez(preds_file, labels=labels, preds=preds, logits=logits)
     logger.info(f"Test predictions saved to {preds_file}")
+
+    # ===== 向量保存（仅 output_vec 模式）=====
+    if args.output_vec:
+
+        pre_cls_arr = np.concatenate(all_pre_cls_vecs, axis=0)  # [N, 1280]
+        mid_arr = np.concatenate(all_mid_vecs, axis=0)  # [N, 256]
+        idx_arr = np.array(all_idx)                         # [N]
+
+        # L2 归一化版本
+        pre_cls_norm = pre_cls_arr / norm(pre_cls_arr, axis=1, keepdims=True).clip(min=1e-9)
+        mid_norm = mid_arr / norm(mid_arr, axis=1, keepdims=True).clip(min=1e-9)
+
+        vec_file = os.path.join(args.output_dir, "vectors.npz")
+        np.savez(
+            vec_file,
+            idx = idx_arr,          # [N]      ← 与数据集对应的唯一键
+            pre_cls_vec = pre_cls_arr,       # [N,1280] 原始
+            pre_cls_vec_l2 = pre_cls_norm,      # [N,1280] L2归一化
+            mid_vec = mid_arr,           # [N,256]  原始
+            mid_vec_l2 = mid_norm,          # [N,256]  L2归一化
+            labels = labels_np,         # [N]      真实标签
+            preds = preds_np,          # [N]      预测结果
+        )
+        logger.info(f"Vectors saved to {vec_file}  (shape: pre_cls={pre_cls_arr.shape}, mid={mid_arr.shape})")
     # with open(os.path.join(args.output_dir,"predictions.txt"),'w') as f:
     #     for example,pred in zip(eval_dataset.examples,preds):
     #         if pred:
